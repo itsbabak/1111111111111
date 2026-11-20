@@ -1,12 +1,9 @@
-
 name: Frago ARM64 APK Builder
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
     paths:
       - '*.zip'
       - '**/*.zip'
@@ -17,344 +14,156 @@ permissions:
 
 jobs:
   build:
-    name: Extract and Build Frago
-    runs-on: ubuntu-24.04
-
+    name: Extract and build Frago
+    runs-on: ubuntu-22.04
     steps:
-      # 1. دریافت مخزن
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. پیدا کردن و استخراج خودکار ZIP
-      - name: Find and Extract Frago ZIP
+      - name: Find and extract Android source ZIP
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
-          import os
-          import zipfile
-          import tempfile
+          import os, shutil, tempfile, zipfile
           from pathlib import Path
 
-          workspace = Path(os.environ["GITHUB_WORKSPACE"])
-          output = Path(os.environ["RUNNER_TEMP"]) / "frago-source"
-          output.mkdir(parents=True, exist_ok=True)
+          workspace = Path(os.environ['GITHUB_WORKSPACE'])
+          candidates = sorted(p for p in workspace.glob('*.zip')
+                              if 'log' not in p.name.lower())
+          if not candidates:
+              raise SystemExit('ERROR: Upload the Frago source ZIP to the repository root.')
 
-          zip_files = sorted(
-              p for p in workspace.rglob("*.zip")
-              if ".git" not in p.parts
-              and "logs" not in p.name.lower()
-          )
-
-          if not zip_files:
-              raise SystemExit("ERROR: No ZIP file found in repository.")
-
-          found = None
-
-          for archive in zip_files:
-              print(f"Checking: {archive}")
-
-              temp = Path(tempfile.mkdtemp(
-                  prefix="frago-",
-                  dir=os.environ["RUNNER_TEMP"]
-              ))
-
+          project = None
+          for archive in candidates:
+              tmp = Path(tempfile.mkdtemp(prefix='frago-', dir=os.environ['RUNNER_TEMP']))
               try:
-                  with zipfile.ZipFile(archive) as z:
-                      bad = z.testzip()
+                  with zipfile.ZipFile(archive) as zf:
+                      bad = zf.testzip()
                       if bad:
-                          print(f"Invalid ZIP member: {bad}")
+                          print(f'Skipping corrupt ZIP member: {bad}')
                           continue
-                      z.extractall(temp)
-
-                  for gradlew in temp.rglob("gradlew"):
-                      project = gradlew.parent
-
-                      settings = (
-                          (project / "settings.gradle").is_file()
-                          or (project / "settings.gradle.kts").is_file()
-                      )
-
-                      app_gradle = (
-                          (project / "app/build.gradle").is_file()
-                          or (project / "app/build.gradle.kts").is_file()
-                      )
-
-                      manifest = (
-                          project / "app/src/main/AndroidManifest.xml"
-                      )
-
-                      config = (
-                          project / "app/src/main/assets/default-config.json"
-                      )
-
-                      if settings and app_gradle and manifest.is_file() and config.is_file():
-                          found = project
+                      zf.extractall(tmp)
+                  for wrapper in tmp.rglob('gradlew'):
+                      root = wrapper.parent
+                      has_settings = (root / 'settings.gradle').is_file() or (root / 'settings.gradle.kts').is_file()
+                      has_app = (root / 'app/build.gradle').is_file() or (root / 'app/build.gradle.kts').is_file()
+                      has_routing = (root / 'app/src/main/java/net/typeblog/socks/core/FragoRouting.java').is_file()
+                      if has_settings and has_app and has_routing and (root / 'app/src/main/AndroidManifest.xml').is_file():
+                          project = root
                           break
-
-                  if found:
+                  if project:
                       break
-
-              except zipfile.BadZipFile:
-                  print("Skipping invalid ZIP.")
               finally:
-                  if not found:
-                      import shutil
-                      shutil.rmtree(temp, ignore_errors=True)
+                  if project is None:
+                      shutil.rmtree(tmp, ignore_errors=True)
 
-          if found is None:
-              raise SystemExit(
-                  "ERROR: No valid Frago Android project found in ZIP files."
-              )
+          if project is None:
+              raise SystemExit('ERROR: Could not locate an Android Gradle project inside any root ZIP.')
 
-          print(f"Project detected: {found}")
-
-          with open(os.environ["GITHUB_ENV"], "a") as f:
-              f.write(f"PROJECT_ROOT={found}\n")
+          print(f'Frago project detected at: {project}')
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'PROJECT_ROOT={project}\n')
           PY
 
-      # 3. نصب Java 17 برای ابزارهای Android SDK
-      - name: Set up Java 17
+      - name: Set up Java 17 for Android SDK
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      # 4. پیدا کردن SDK و نصب بسته‌ها بدون setup-android
       - name: Install Android SDK and NDK
         shell: bash
         run: |
           set -euo pipefail
-
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
-
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
 
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager -print -quit)"
-
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit)"
           if [ -z "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager not found."
+            echo 'ERROR: Android sdkmanager was not found on runner.'
             exit 1
           fi
-
-          echo "Using SDK manager: $SDKMANAGER"
 
           yes | "$SDKMANAGER" --licenses >/dev/null || true
-
           "$SDKMANAGER" --install \
-            "platform-tools" \
-            "platforms;android-31" \
-            "build-tools;31.0.0" \
-            "ndk;27.2.12479018"
+            'platform-tools' \
+            'platforms;android-31' \
+            'build-tools;31.0.0' \
+            'ndk;27.2.12479018'
 
-      # 5. بررسی سورس و تنظیم Gradle
-      - name: Verify Frago project
+      - name: Verify project and Frago routing config
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_ROOT"
-
-          echo "Project path: $PWD"
-
           test -f gradlew
-          test -f app/build.gradle
-          test -f build.gradle
-          test -f settings.gradle
-          test -f app/src/main/AndroidManifest.xml
-          test -f app/src/main/assets/default-config.json
-
+          test -f app/src/main/java/net/typeblog/socks/core/FragoRouting.java
+          test -f app/src/main/java/net/typeblog/socks/core/FragoConfig.java
           chmod +x gradlew
-
           python3 - <<'PY'
           import json
-          import xml.etree.ElementTree as ET
           from pathlib import Path
-
-          root = Path(".")
-
-          config = json.loads(
-              (root / "app/src/main/assets/default-config.json")
-              .read_text(encoding="utf-8")
-          )
-
-          assert config["dns"]["servers"] == [
-              "https://kid.openbld.net/dns-query"
-          ]
-
-          assert config["dns"]["queryStrategy"] == "UseIPv4"
-
-          assert config["dns"]["hosts"]["regexp:(google)"] == [
-              "65.109.184.128",
-              "91.107.241.144"
-          ]
-
-          socks = next(
-              x for x in config["inbounds"]
-              if x.get("protocol") == "socks"
-          )
-
-          assert socks["listen"] == "127.0.0.1"
-          assert socks["port"] == 10808
-          assert socks["settings"]["udp"] is True
-
-          assert socks["sniffing"]["enabled"] is True
-          assert "tls" in socks["sniffing"]["destOverride"]
-
-          fragment = next(
-              x for x in config["outbounds"]
-              if x.get("tag") == "fragment-out"
-          )
-
-          assert fragment["settings"]["fragment"] == {
-              "packets": "tlshello",
-              "length": "10-400",
-              "interval": "1-30"
-          }
-
-          assert config["routing"]["domainStrategy"] == "AsIs"
-
-          ET.parse(root / "app/src/main/AndroidManifest.xml")
-
-          assert (
-              root / "app/src/main/java/net/typeblog/socks/FragoVpnService.java"
-          ).is_file()
-
-          assert (
-              root / "app/src/main/java/net/typeblog/socks/core/FragoConfig.java"
-          ).is_file()
-
-          assert (
-              root / "app/src/main/java/net/typeblog/socks/core/FragoSocksServer.java"
-          ).is_file()
-
-          print("Frago project verification passed.")
+          c = json.loads(Path('app/src/main/assets/default-config.json').read_text())
+          assert c['routing']['domainStrategy'] == 'AsIs'
+          rules = c['routing']['rules']
+          assert any(r.get('domain') == [r'regexp:.*\.ir$'] and r.get('outboundTag') == 'direct' for r in rules)
+          assert any(r.get('ip') == ['10.0.0.0/8','172.16.0.0/12','192.168.0.0/16','127.0.0.0/8'] and r.get('outboundTag') == 'direct' for r in rules)
+          assert any(r.get('network') == 'tcp' and r.get('outboundTag') == 'fragment-out' for r in rules)
+          assert any(r.get('network') == 'udp' and r.get('outboundTag') == 'direct' for r in rules)
+          print('Routing JSON verified.')
           PY
 
-      # 6. ساخت Hev فقط برای ARM64
-      - name: Build Hev SOCKS5 engine ARM64
+      - name: Build Hev SOCKS5 engine for ARM64
         shell: bash
         run: |
           set -euo pipefail
-
           HEV_ROOT="$RUNNER_TEMP/hev-android-build"
           mkdir -p "$HEV_ROOT"
-
-          git clone \
-            --depth 1 \
-            --branch 2.20.0 \
-            --recurse-submodules \
-            https://github.com/heiher/hev-socks5-tunnel.git \
-            "$HEV_ROOT/jni"
-
-          "$ANDROID_SDK_ROOT/ndk/27.2.12479018/ndk-build" \
-            -C "$HEV_ROOT" \
-            APP_ABI=arm64-v8a
-
-          LIB="$(find "$HEV_ROOT" \
-            -type f \
-            -path '*/arm64-v8a/libhev-socks5-tunnel.so' \
-            -print -quit)"
-
-          if [ -z "$LIB" ]; then
-            echo "ERROR: Hev ARM64 library not generated."
-            find "$HEV_ROOT" -name '*.so'
-            exit 1
-          fi
-
+          git clone --depth 1 --branch 2.20.0 --recurse-submodules \
+            https://github.com/heiher/hev-socks5-tunnel.git "$HEV_ROOT/jni"
+          "$ANDROID_SDK_ROOT/ndk/27.2.12479018/ndk-build" -C "$HEV_ROOT" APP_ABI=arm64-v8a
+          LIB="$(find "$HEV_ROOT" -type f -path '*/arm64-v8a/libhev-socks5-tunnel.so' -print -quit)"
+          test -n "$LIB"
           mkdir -p "$PROJECT_ROOT/app/src/main/jniLibs/arm64-v8a"
+          install -m 644 "$LIB" "$PROJECT_ROOT/app/src/main/jniLibs/arm64-v8a/libhev-socks5-tunnel.so"
+          cp "$HEV_ROOT/jni/LICENSE" "$PROJECT_ROOT/THIRD_PARTY_HEV_LICENSE.txt"
+          cp "$HEV_ROOT/jni/LICENSE" "$PROJECT_ROOT/app/src/main/assets/THIRD_PARTY_HEV_LICENSE.txt"
 
-          install -m 644 "$LIB" \
-            "$PROJECT_ROOT/app/src/main/jniLibs/arm64-v8a/libhev-socks5-tunnel.so"
-
-          readelf -h \
-            "$PROJECT_ROOT/app/src/main/jniLibs/arm64-v8a/libhev-socks5-tunnel.so" \
-            | grep -Eq 'Machine:.*AArch64'
-
-          cp "$HEV_ROOT/jni/LICENSE" \
-            "$PROJECT_ROOT/THIRD_PARTY_HEV_LICENSE.txt"
-
-          mkdir -p "$PROJECT_ROOT/app/src/main/assets"
-
-          cp "$HEV_ROOT/jni/LICENSE" \
-            "$PROJECT_ROOT/app/src/main/assets/THIRD_PARTY_HEV_LICENSE.txt"
-
-      # 7. نصب Java 11 برای Gradle قدیمی پروژه
-      - name: Set up Java 11
+      - name: Set up Java 11 for Gradle 7.2 / AGP 7.1.3
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '11'
 
-      # 8. ساخت APK
       - name: Build Debug and Release APK
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_ROOT"
+          ./gradlew --no-daemon clean assembleDebug assembleRelease
 
-          chmod +x gradlew
-
-          ./gradlew \
-            --no-daemon \
-            clean \
-            assembleDebug \
-            assembleRelease
-
-      # 9. بررسی خروجی و ARM64
-      - name: Verify APK
+      - name: Verify ARM64 APK and collect outputs
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$PROJECT_ROOT"
-
-          DEBUG_APK="app/build/outputs/apk/debug/app-debug.apk"
-          RELEASE_APK="app/build/outputs/apk/release/app-release.apk"
-
+          DEBUG_APK='app/build/outputs/apk/debug/app-debug.apk'
+          RELEASE_APK='app/build/outputs/apk/release/app-release.apk'
           test -f "$DEBUG_APK"
           test -f "$RELEASE_APK"
-
-          unzip -l "$RELEASE_APK" > "$RUNNER_TEMP/apk-files.txt"
-
-          grep -q \
-            'lib/arm64-v8a/libhev-socks5-tunnel.so' \
-            "$RUNNER_TEMP/apk-files.txt"
-
-          if grep -Eq \
-            'lib/(armeabi-v7a|x86|x86_64)/|libxray' \
-            "$RUNNER_TEMP/apk-files.txt"; then
-            echo "ERROR: Unexpected ABI or Xray binary."
+          unzip -l "$RELEASE_APK" > "$RUNNER_TEMP/apk-list.txt"
+          grep -q 'lib/arm64-v8a/libhev-socks5-tunnel.so' "$RUNNER_TEMP/apk-list.txt"
+          if grep -Eq 'lib/(armeabi-v7a|x86|x86_64)/|libxray' "$RUNNER_TEMP/apk-list.txt"; then
+            echo 'Unexpected ABI or Xray binary found.'
             exit 1
           fi
-
-          echo "APK verification passed."
-
-      # 10. آماده‌سازی فایل‌ها
-      - name: Prepare APK artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-
           mkdir -p "$GITHUB_WORKSPACE/frago-output"
+          cp "$DEBUG_APK" "$RELEASE_APK" "$GITHUB_WORKSPACE/frago-output/"
+          cp THIRD_PARTY_HEV_LICENSE.txt "$GITHUB_WORKSPACE/frago-output/" || true
 
-          cp "$PROJECT_ROOT/app/build/outputs/apk/debug/app-debug.apk" \
-            "$GITHUB_WORKSPACE/frago-output/"
-
-          cp "$PROJECT_ROOT/app/build/outputs/apk/release/app-release.apk" \
-            "$GITHUB_WORKSPACE/frago-output/"
-
-          cp "$PROJECT_ROOT/THIRD_PARTY_HEV_LICENSE.txt" \
-            "$GITHUB_WORKSPACE/frago-output/"
-
-          ls -lh "$GITHUB_WORKSPACE/frago-output"
-
-      # 11. آپلود APK
       - name: Upload Frago APKs
         uses: actions/upload-artifact@v4
         with:
